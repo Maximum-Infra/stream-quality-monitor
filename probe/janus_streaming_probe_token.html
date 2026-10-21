@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Janus Streaming Probe</title>
+
+  <!-- MUST be absolute paths as requested -->
+  <script src="/adapter.js"></script>
+  <script src="/janus.js"></script>
+
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
+    #wrap { max-width: 1200px; }
+    #log {
+      background: #0b0f14; color: #9ef29e; padding: 12px; border-radius: 8px;
+      height: 220px; overflow: auto; white-space: pre-wrap; font-family: ui-monospace, Menlo, Consolas, monospace;
+      border: 1px solid #1a2430;
+    }
+    video {
+      width: 100%; max-width: 1100px; background: #111; border-radius: 12px;
+      margin-top: 12px; border: 1px solid #ddd;
+    }
+    .row { display: flex; gap: 12px; margin: 10px 0; flex-wrap: wrap; }
+    .pill { padding: 6px 10px; border: 1px solid #ddd; border-radius: 999px; font-size: 13px; }
+    button { padding: 8px 12px; border-radius: 8px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+    button:hover { background: #f5f5f5; }
+  </style>
+</head>
+
+<body>
+  <div id="wrap">
+    <h2>Janus Streaming Probe</h2>
+
+    <div class="row">
+      <div class="pill" id="pillServer">server=</div>
+      <div class="pill" id="pillStream">stream=</div>
+      <div class="pill" id="pillSecret">apiSecret=</div>
+      <div class="pill" id="pillToken">token=</div>
+    </div>
+
+    <div class="row">
+      <button id="btnReconnect">Reconnect</button>
+      <button id="btnUnmute">Unmute</button>
+      <button id="btnMute">Mute</button>
+    </div>
+
+    <div id="log"></div>
+
+    <!-- Muted by default to satisfy browser autoplay policies; use Unmute button if needed -->
+    <video id="remoteVideo" autoplay playsinline muted controls></video>
+  </div>
+
+<script>
+(() => {
+  // -------- params ----------
+  const qs = new URLSearchParams(location.search);
+  const streamId = parseInt(qs.get("stream") || "0", 10);
+  const server = qs.get("server") || ((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/janus");
+  const apiSecret = qs.get("apisecret") || qs.get("apiSecret") || "";
+  const token = qs.get("token") || "";
+
+  const pillServer = document.getElementById("pillServer");
+  const pillStream = document.getElementById("pillStream");
+  const pillSecret = document.getElementById("pillSecret");
+  const pillToken = document.getElementById("pillToken");
+  pillServer.textContent = `server=${server}`;
+  pillStream.textContent = `stream=${streamId || "MISSING"}`;
+  pillSecret.textContent = `apiSecret=${apiSecret ? "SET" : "NOT SET"}`;
+  pillToken.textContent = `token=${token ? "SET" : "NOT SET"}`;
+
+  const logEl = document.getElementById("log");
+  const videoEl = document.getElementById("remoteVideo");
+  videoEl.addEventListener("loadedmetadata", () => {
+    log(`video dimensions: ${videoEl.videoWidth}x${videoEl.videoHeight}`);
+  });
+
+  function log(...args) {
+    const line = args.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
+    logEl.textContent += line + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+    console.log(...args);
+  }
+
+  // -------- janus state ----------
+  let janus = null;
+  let streaming = null;
+  let started = false;
+
+  function cleanup() {
+    started = false;
+    try { if (streaming) streaming.detach(); } catch (e) {}
+    streaming = null;
+
+    try { if (janus) janus.destroy(); } catch (e) {}
+    janus = null;
+
+    try {
+      // stop video element
+      if (videoEl.srcObject) {
+        videoEl.srcObject.getTracks().forEach(t => t.stop());
+      }
+      videoEl.srcObject = null;
+      videoEl.removeAttribute("src");
+      videoEl.load();
+    } catch (e) {}
+  }
+
+  async function start() {
+    cleanup();
+
+    if (!streamId) {
+      log("ERROR: Missing ?stream= (mountpoint id)");
+      return;
+    }
+
+    log("loading…");
+    log("stream=" + streamId);
+    log("server=" + server);
+    log("apiSecret=" + (apiSecret ? "SET" : "NOT SET"));
+    log("token=" + (token ? "SET" : "NOT SET"));
+
+    Janus.init({
+      debug: "all",
+      callback: () => {
+        log("Janus.init OK");
+
+        janus = new Janus({
+          server,
+          apisecret: apiSecret || undefined,
+          token: token || undefined,
+          success: () => {
+            log("Janus session created");
+
+            janus.attach({
+              plugin: "janus.plugin.streaming",
+              success: (handle) => {
+                streaming = handle;
+                log("Attached to streaming plugin");
+
+                // Request watch. If you want to force only video/audio, set offer_audio/offer_video.
+                const watch = {
+                  request: "watch",
+                  id: streamId,
+                  // offer_audio: true,
+                  // offer_video: true
+                };
+
+                streaming.send({ message: watch });
+                log("Sent watch");
+              },
+              error: (err) => {
+                log("ERROR attach:", err);
+              },
+
+              iceState: (state) => log("ICE state:", state),
+              webrtcState: (on) => log("WebRTC PeerConnection is", on ? "up" : "down"),
+              slowLink: (uplink, lost) => log("slowLink:", { uplink, lost }),
+              oncleanup: () => log("oncleanup"),
+              ondetached: () => log("ondetached"),
+
+              // Newer Janus versions
+              onremotetrack: (track, mid, on) => {
+                log("onremotetrack:", { kind: track.kind, mid, on });
+                if (!on) return;
+                if (track.kind === "video" && track.getSettings) {
+                  log("video track settings:", track.getSettings());
+                }
+
+                // Build/extend a MediaStream for the video element
+                let ms = videoEl.srcObject;
+                if (!ms) ms = new MediaStream();
+                ms.addTrack(track);
+                videoEl.srcObject = ms;
+              },
+
+              // Older Janus versions
+              onremotestream: (stream) => {
+                log("onremotestream:", stream ? "OK" : "null");
+                Janus.attachMediaStream(videoEl, stream);
+              },
+
+              onmessage: (msg, jsep) => {
+                log("onmessage:", msg);
+
+                // Status events are normal: preparing/starting/started/stopped...
+                if (msg && msg.result && msg.result.status) {
+                  log("status:", msg.result.status);
+                }
+
+                // The offer arrives as JSEP here.
+                if (jsep) {
+                  log("Got JSEP offer, creating answer…");
+
+                  // IMPORTANT: for the Streaming plugin, pass the offer JSEP directly to createAnswer.
+                  streaming.createAnswer({
+                    jsep: jsep,
+                    media: { audioSend: false, videoSend: false, data: false },
+                    success: (ourJsep) => {
+                      log("Created answer, sending start…");
+                      started = true;
+                      streaming.send({
+                        message: { request: "start" },
+                        jsep: ourJsep
+                      });
+                    },
+                    error: (err) => {
+                      log("createAnswer error:", err);
+                    }
+                  });
+                }
+              }
+            });
+          },
+          error: (err) => {
+            log("ERROR Janus session:", err);
+          },
+          destroyed: () => {
+            log("Janus session destroyed");
+          }
+        });
+      }
+    });
+  }
+
+  // -------- UI controls ----------
+  document.getElementById("btnReconnect").addEventListener("click", () => {
+    log("Reconnect requested");
+    start();
+  });
+  document.getElementById("btnUnmute").addEventListener("click", () => {
+    videoEl.muted = false;
+    videoEl.play().catch(() => {});
+    log("Video unmuted");
+  });
+  document.getElementById("btnMute").addEventListener("click", () => {
+    videoEl.muted = true;
+    log("Video muted");
+  });
+
+  window.addEventListener("beforeunload", () => cleanup());
+
+  // Kick off
+  start();
+})();
+</script>
+</body>
+</html>
