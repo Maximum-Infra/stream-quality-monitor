@@ -1,0 +1,8 @@
+{
+  "probe_url": "https://your-janus-server.example.com/path/janus_streaming_probe.html",
+  "streams": [
+    { "id": "100001", "zoom_in_view": 1 },
+    { "id": "100002", "zoom_in_view": 1 },
+    { "id": "100003", "zoom_in_view": 0 }
+  ]
+}
